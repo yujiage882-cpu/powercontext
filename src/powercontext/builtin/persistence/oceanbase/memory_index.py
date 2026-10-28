@@ -86,6 +86,7 @@ SELECT
     m.entry_id,
     m.entry_version_id,
     v.text,
+    v.created_in_revision,
     l2_distance(m.embedding, :query_vector) AS distance
 FROM pc_memory_vector_entries AS m
 JOIN pc_memory_entry_versions AS v
@@ -105,6 +106,7 @@ SELECT
     h.entry_id,
     h.entry_version_id,
     v.text,
+    v.created_in_revision,
     MATCH(h.searchable_text) AGAINST(:query) AS fts_score,
     l2_distance(m.embedding, :query_vector) AS distance
 FROM pc_memory_entry_heads AS h

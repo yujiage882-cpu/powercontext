@@ -862,11 +862,12 @@ class ScopedContextApplication:
         from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta, ContextPackError
 
         prepared = await self.prepare(request)
-        pack = ContextPack.from_content(prepared.content or "", chunk_bytes=chunk_bytes)
+        content = prepared.content or ""
+        if base_pack is not None and not isinstance(base_pack, ContextPack):
+            raise ContextPackError("context-pack:base-not-pack")
+        pack = ContextPack.from_content(content, chunk_bytes=chunk_bytes)
         if base_pack is None:
             return pack
-        if not isinstance(base_pack, ContextPack):
-            raise ContextPackError("context-pack:base-not-pack")
         return ContextPackDelta.between(base_pack, pack)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:

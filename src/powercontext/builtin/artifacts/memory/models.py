@@ -202,6 +202,7 @@ class MemoryChannelHit(BaseModel):
     entry_version_id: str
     text: str
     distance: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    created_in_revision: int | None = Field(default=None, ge=1)
 
 
 class MemoryHit(BaseModel):
@@ -213,6 +214,7 @@ class MemoryHit(BaseModel):
     text: str
     score: float
     matched_by: tuple[MemoryMatchedBy, ...]
+    created_in_revision: int | None = Field(default=None, ge=1)
 
 
 class MemoryRerankTrace(BaseModel):

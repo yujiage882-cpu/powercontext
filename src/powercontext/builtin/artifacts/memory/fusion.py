@@ -107,6 +107,7 @@ def fuse_rankings(
             text=candidates[identity].text,
             score=scores[identity],
             matched_by=tuple(channel for channel in ("fts", "vector") if channel in channels[identity]),
+            created_in_revision=candidates[identity].created_in_revision,
         )
         for identity in ordered
     )
