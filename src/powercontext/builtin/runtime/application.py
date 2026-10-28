@@ -189,6 +189,7 @@ from powercontext.builtin.runtime.models import (
     ListExternalSkillsRequest,
     MemoryChangesPage,
     MemoryEntriesPage,
+    MemoryEntryStateRequest,
     MemoryEntryRecord,
     MemoryFlushResult,
     MemoryMutationResult,
@@ -213,6 +214,7 @@ from powercontext.builtin.runtime.models import (
     SubmitSourceObservation,
     TopicMemoryFlushResult,
 )
+from powercontext.builtin.runtime.source_lifecycle import LifecycleApplication
 from powercontext.builtin.runtime.prepared_code import PreparedCodeCandidate, code_candidates
 from powercontext.builtin.runtime.prepared_context import (
     PreparedContextBuild,
@@ -2589,6 +2591,36 @@ class ScopedMemoryApplication:
                 entry=_entry_record(updated, retired),
             )
 
+    async def set_state(self, request: MemoryEntryStateRequest, /) -> MemoryMutationResult:
+        """Activate or deactivate one entry of the scope's Memory head in place."""
+
+        async with self._runtime._context(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+        ) as context:
+            async with self._runtime._locked(self.scope_id):
+                service = context.artifacts.memory
+                current = await service.head(context.artifacts.memory_artifact_id)
+                entries = await service.entries(current)
+                entry = next(
+                    (item for item in entries if item.entry_id == request.citation.entry_id),
+                    None,
+                )
+                if entry is None:
+                    raise InvalidRuntimeRequestError("memory-entry")
+                updated = (
+                    await service.reactivate(current, entries=(entry,), reason=request.reason)
+                    if request.active
+                    else await service.forget(current, entries=(entry,), reason=request.reason)
+                )
+            current_entries = await service.entries(updated)
+            transitioned = next(item for item in current_entries if item.entry_id == entry.entry_id)
+            return MemoryMutationResult(
+                previous_revision=current.revision,
+                memory_ref=updated.as_ref(),
+                entry=_entry_record(updated, transitioned),
+            )
+
     async def changes(self, *, since_revision: int | None = None) -> MemoryChangesPage:
         async with self._runtime._context(self.scope_id) as context:
             service = context.artifacts.memory
@@ -2687,6 +2719,15 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        inactive_topics = await self._runtime.lifecycle.for_scope(self.scope_id).inactive_topic_ids()
+        if inactive_topics:
+            result = result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit for hit in result.hits if hit.artifact_ref.artifact_id not in inactive_topics
+                    )
+                }
+            )
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2996,6 +3037,7 @@ class BuiltinRuntime:
         self,
         *,
         provider: PowerContextProvider[BuiltinSources, BuiltinArtifacts, BuiltinTriggers],
+        database: Any = None,
         capabilities: RuntimeCapabilities,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
@@ -3055,6 +3097,7 @@ class BuiltinRuntime:
         if scope_cache_size < 1:
             raise _RuntimeConfigurationError("scope_cache_size")
         self._provider = provider
+        self.database = database
         self._capabilities = capabilities
         self._review_service = review_service
         self.profiles = profiles
@@ -3136,6 +3179,7 @@ class BuiltinRuntime:
         self.skill = SkillApplication(self)
         self.remote_skills = RemoteSkillApplication(self)
         self.statistics = StatisticsApplication(self)
+        self.lifecycle = LifecycleApplication(self)
         self.handoff_report: HandoffReportApplication | None = None
         self.artifact_processing_supervisor: ArtifactProcessingSupervisors | None = None
         self.processor = None if scope_ids is None else ScheduledSourceProcessor(self, scope_ids)

@@ -311,6 +311,14 @@ class RetireMemoryEntryRequest(BaseModel):
     reason: str | None = None
 
 
+class MemoryEntryStateRequest(BaseModel):
+    """Activate or deactivate one exact Memory entry version in place."""
+
+    citation: MemoryCitation
+    active: bool
+    reason: str | None = None
+
+
 class MemoryMutationResult(BaseModel):
     previous_revision: int | None
     memory_ref: ArtifactRef
