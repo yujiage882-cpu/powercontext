@@ -309,47 +309,66 @@ class PreparedContextBuilder:
         if not query_terms:
             return None
         query_numbers = {term for term in query_terms if term.isdigit()}
-        windows: list[tuple[float, int, int, int, int]] = []
+        sentences: list[list[tuple[int, int]]] = []
+        scores: list[list[float]] = []
         document_frequency: dict[str, int] = {}
-        for index, (_, _, text) in enumerate(records):
-            sentences = _evidence_sentences(text)
-            for start, end in sentences:
-                for term in _evidence_terms(text[start:end]):
-                    document_frequency.setdefault(term, 0)
-            for term in _evidence_terms(text):
+        for _, _, text in records:
+            for term in set(_evidence_terms(text)):
                 document_frequency[term] = document_frequency.get(term, 0) + 1
-            for position, (start, end) in enumerate(sentences):
-                for width in (1, 2):
-                    if position + width > len(sentences):
-                        break
-                    span_start = start
-                    span_end = sentences[position + width - 1][1]
-                    score = _evidence_score(
-                        text[span_start:span_end],
+        for _, _, text in records:
+            spans = _evidence_sentences(text)
+            sentences.append(spans)
+            scores.append(
+                [
+                    _evidence_score(
+                        text[start:end],
                         query_terms,
                         document_frequency,
                         len(records),
                         query_numbers,
-                        width,
+                        1,
                     )
-                    if score > 0.0:
-                        windows.append((score, index, span_start, span_end, width))
-        if not windows:
-            return None
-        windows.sort(key=lambda window: (-window[0], window[1], window[2]))
+                    for start, end in spans
+                ]
+            )
 
         chosen: list[tuple[int, int, int, float]] = []
-        occupied: dict[int, list[tuple[int, int]]] = {}
         fragments: list[PreparedContextFragment] = []
-        for score, index, start, end, width in windows:
-            spans = occupied.setdefault(index, [])
-            if any(not (end <= other_start or start >= other_end) for other_start, other_end in spans):
+
+        def fits(candidate: tuple[int, int, int, float]) -> bool:
+            return _evidence_bytes(records, [*chosen, candidate]) <= request.max_bytes
+
+        # Every fragment repeats its whole citation, so a scatter of short windows spends the
+        # budget on bookkeeping instead of on text: the payload is what carries evidence tokens.
+        # Two contiguous slices keep the delivered characters dense enough to be useful.
+        order = sorted(
+            range(len(records)),
+            key=lambda index: (-max(scores[index], default=0.0), index),
+        )
+        for index in order:
+            if len(chosen) >= 2:
+                break
+            spans = sentences[index]
+            if not spans:
                 continue
-            candidate = (index, start, end, score)
-            if _evidence_bytes(records, [*chosen, candidate]) > request.max_bytes:
+            text = records[index][2]
+            whole = (index, 0, len(text), sum(scores[index]))
+            if fits(whole):
+                chosen.append(whole)
                 continue
-            chosen.append(candidate)
-            spans.append((start, end))
+            coverage = [len({term for term in query_terms if term in _evidence_terms(text[start:end])}) for start, end in spans]
+            best: tuple[int, int, int, float] | None = None
+            for first in range(len(spans)):
+                running = 0.0
+                for last in range(first, len(spans)):
+                    running += coverage[last]
+                    candidate = (index, spans[first][0], spans[last][1], running)
+                    if not fits(candidate):
+                        break
+                    if best is None or running > best[3]:
+                        best = candidate
+            if best is not None:
+                chosen.append(best)
         if not chosen:
             return None
         chosen.sort(key=lambda item: (item[0], item[1]))
