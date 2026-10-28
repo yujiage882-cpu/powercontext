@@ -587,13 +587,7 @@ class PreparedContextBuilder:
             raise PreparedContextInvariantError("memory-ref-missing")
         memory_entries: list[_PreparedContextEntry] = []
         seen: set[tuple[str, str]] = set()
-        # Ranking decides *which* entries travel; collection order decides *where* they sit.
-        # A pack that re-sorts by this turn's scores reshuffles every delivered item, so a
-        # client holding the previous pack could never reuse its prefix. Ordering by the
-        # revision an entry version was first published in keeps earlier entries pinned to
-        # their previous position and only ever appends newly collected ones.
-        ordered_hits = sorted(hits, key=_collection_order)
-        for hit in ordered_hits:
+        for hit in hits:
             if hit.memory_ref != memory_ref:
                 raise PreparedContextInvariantError("memory-ref-mismatch")
 
@@ -603,16 +597,15 @@ class PreparedContextBuilder:
             seen.add(citation_key)
             if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
                 continue
-            cited_ref = _entry_created_ref(hit.memory_ref, hit.created_in_revision)
             citation = MemoryCitation(
-                memory_ref=cited_ref,
+                memory_ref=hit.memory_ref,
                 entry_id=hit.entry_id,
                 entry_version_id=hit.entry_version_id,
             )
             origin: PreparedContextOrigin = citation
             rendered_citation = citation.model_dump(mode="json")
             if scope_id is not None:
-                memory = ArtifactAddress(scope_id=scope_id, artifact=cited_ref)
+                memory = ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref)
                 origin = MemoryEntryAddress(
                     memory=memory,
                     entry_id=hit.entry_id,
@@ -818,29 +811,6 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     for index in range(max((len(group) for group in groups), default=0)):
         ordered.extend(group[index] for group in groups if index < len(group))
     return tuple(ordered)
-
-
-
-def _collection_order(hit: MemoryHit) -> tuple[int, str]:
-    """Order entries by the revision that first published this exact version.
-
-    Entries collected earlier keep a smaller key forever, so a later turn only ever
-    extends the tail of the delivered pack instead of permuting it.
-    """
-
-    return (hit.created_in_revision or 0, hit.entry_id)
-
-
-def _entry_created_ref(memory_ref: ArtifactRef, created_in_revision: int | None) -> ArtifactRef:
-    """Cite the revision this entry version was published in, not the moving head.
-
-    ``entry_version_id`` already pins the exact content, so naming the publishing
-    revision stays an exact citation while remaining identical across later turns.
-    """
-
-    if created_in_revision is None or created_in_revision == memory_ref.revision:
-        return memory_ref
-    return memory_ref.model_copy(update={"revision": created_in_revision})
 
 
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:

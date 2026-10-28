@@ -133,8 +133,7 @@ _DELETE_FTS_ENTRIES_SQL = text(
 ).bindparams(bindparam("entry_ids", expanding=True))
 _SEARCH_FTS_SQL = text(
     """
-    SELECT f.memory_artifact_id, f.head_revision, f.entry_id, f.entry_version_id, v.text,
-           v.created_in_revision
+    SELECT f.memory_artifact_id, f.head_revision, f.entry_id, f.entry_version_id, v.text
     FROM pc_memory_entry_fts AS f
     JOIN pc_memory_entry_versions AS v
       ON v.scope_id = f.scope_id
@@ -211,7 +210,7 @@ _VECTOR_SEARCH_SQL = text(
           AND k = :neighbor_limit
     )
     SELECT m.memory_artifact_id, m.head_revision, m.entry_id, m.entry_version_id, v.text,
-           v.created_in_revision, nearest.distance
+           nearest.distance
     FROM nearest
     JOIN pc_memory_vector_entries AS m ON m.vector_id = nearest.rowid
     JOIN pc_memory_entry_versions AS v

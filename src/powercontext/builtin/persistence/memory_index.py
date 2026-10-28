@@ -51,9 +51,6 @@ def memory_channel_hits(
             entry_version_id=str(row["entry_version_id"]),
             text=str(row["text"]),
             distance=None if row.get("distance") is None else float(row["distance"]),
-            created_in_revision=(
-                None if row.get("created_in_revision") is None else int(row["created_in_revision"])
-            ),
         )
         for row in rows
         if str(row["memory_artifact_id"]) in requested
