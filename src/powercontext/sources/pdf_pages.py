@@ -403,9 +403,19 @@ def _numbers(text: str) -> frozenset:
 
 
 class _PageIndex(object):
-    __slots__ = ("entries", "counters", "lengths", "average_length", "document_frequency", "size", "lowered", "numbers")
+    __slots__ = (
+        "entries",
+        "counters",
+        "lengths",
+        "average_length",
+        "document_frequency",
+        "size",
+        "lowered",
+        "numbers",
+        "documents",
+    )
 
-    def __init__(self, entries, texts) -> None:
+    def __init__(self, entries, texts, documents=()) -> None:
         from collections import Counter
 
         self.entries = entries
@@ -429,9 +439,19 @@ class _PageIndex(object):
         self.document_frequency = document_frequency
         self.lowered = tuple(lowered)
         self.numbers = tuple(numbers)
+        self.documents = tuple(documents) if documents else tuple("" for _ in range(self.size))
 
 
 _INDEX_CACHE = {}
+
+
+def _document_of(text: str) -> str:
+    """Return the document id a page was captured under (its leading identity line)."""
+
+    head, sep, _ = text.partition("\n")
+    if sep and 0 < len(head) <= 200 and " " not in head:
+        return head.strip()
+    return ""
 
 
 def _page_text(text: str) -> str:
@@ -450,7 +470,12 @@ async def _page_index(memory):
     cached = _INDEX_CACHE.get(key)
     if cached is not None and cached[0] == len(entries):
         return cached[1]
-    index = _PageIndex(entries, tuple(_page_text(record.entry.text) for record in entries))
+    raw = tuple(record.entry.text for record in entries)
+    index = _PageIndex(
+        entries,
+        tuple(_page_text(text) for text in raw),
+        tuple(_document_of(text) for text in raw),
+    )
     _INDEX_CACHE[key] = (len(entries), index)
     return index
 
@@ -475,12 +500,43 @@ def _query_terms(question: str, index) -> tuple:
     return primary, extra
 
 
+def _document_focus(question: str, index) -> frozenset:
+    """Return the captured documents a question names, so ranking can stay inside them.
+
+    Financial questions name the filer ("...for PepsiCo?", "Did AMD report...?"), and every page
+    carries the document id it was captured under.  When the question names one or more captured
+    documents, restricting candidates to them removes the whole cross-document noise floor without
+    hard-coding any document, company, or corpus.
+    """
+
+    lowered = " ".join(_tokens(question))
+    compact = lowered.replace(" ", "")
+    raw = question.lower()
+    focused = set()
+    for document in set(index.documents):
+        if not document:
+            continue
+        stem = document.split(":")[0].split("_")[0].strip().lower()
+        if len(stem) < 2:
+            continue
+        if stem in raw or stem in compact:
+            focused.add(document)
+    return frozenset(focused)
+
+
 def _statement_kinds(question_terms: str) -> tuple:
     kinds = []
     for kind, triggers in _STATEMENT_TRIGGERS.items():
         if any(trigger in question_terms for trigger in triggers):
             kinds.append(kind)
     return tuple(kinds)
+
+
+def _phrase_pairs(question: str) -> tuple:
+    tokens = _tokens(question)
+    return tuple(
+        " ".join((tokens[position], tokens[position + 1])) for position in range(len(tokens) - 1)
+    )
 
 
 def _rank_pages(index, question: str, limit: int) -> list:
@@ -503,6 +559,13 @@ def _rank_pages(index, question: str, limit: int) -> list:
 
     kinds = _statement_kinds(" ".join(_tokens(question)))
     question_numbers = set(_numbers(question))
+    focus = _document_focus(question, index)
+    phrases = _phrase_pairs(question)
+    candidates = range(index.size)
+    if focus:
+        candidates = tuple(
+            position for position in range(index.size) if index.documents[position] in focus
+        )
 
     def structural_bonus(position) -> float:
         # Financial questions are usually answered by one of the primary statements.  A page that
@@ -515,15 +578,20 @@ def _rank_pages(index, question: str, limit: int) -> list:
                 if any(hint in text for hint in _STATEMENT_HINTS[kind]):
                     bonus += 6.0
                     break
+        if phrases and index.lowered:
+            phrase_hits = sum(1 for phrase in phrases if phrase in index.lowered[position])
+            if phrase_hits:
+                bonus += 0.6 * phrase_hits
         if question_numbers and index.numbers:
             shared = len(question_numbers & index.numbers[position])
             if shared:
-                bonus += 3.0 * min(shared, 3)
+                bonus += 1.5 * min(shared, 3)
         return bonus
 
     def score_all(boost):
-        scores = []
-        for position, counter in enumerate(index.counters):
+        scores = [0.0] * index.size
+        for position in candidates:
+            counter = index.counters[position]
             length_ratio = index.lengths[position] / index.average_length
             score = 0.0
             for term in primary:
@@ -541,11 +609,11 @@ def _rank_pages(index, question: str, limit: int) -> list:
                         frequency + 1.2 * (0.25 + 0.75 * length_ratio)
                     )
             score += structural_bonus(position)
-            scores.append(score)
+            scores[position] = score
         return scores
 
     scores = score_all({})
-    order = sorted(range(len(scores)), key=lambda position: -scores[position])
+    order = sorted(candidates, key=lambda position: -scores[position])
     # Pseudo-relevance feedback: the strongest first-pass pages show the wording a supporting page
     # actually uses (statement captions, line-item names), so their distinctive terms are folded
     # back into the query once.  A single weighted pass over two pages keeps the result stable and
@@ -565,7 +633,7 @@ def _rank_pages(index, question: str, limit: int) -> list:
     if feedback:
         top_terms = sorted(feedback.items(), key=lambda item: -item[1])[:10]
         scores = score_all({term: 0.2 for term, _ in top_terms})
-        order = sorted(range(len(scores)), key=lambda position: -scores[position])
+        order = sorted(candidates, key=lambda position: -scores[position])
     ranked = []
     for position in order:
         if scores[position] <= 0 or len(ranked) >= max(limit, 1):
