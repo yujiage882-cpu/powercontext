@@ -355,8 +355,55 @@ def _build_synonyms() -> dict:
 _SYNONYMS = _build_synonyms()
 
 
+_STATEMENT_HINTS = {
+    "bs": ("consolidated balance sheet", "balance sheets", "total assets", "total liabilities"),
+    "is": (
+        "consolidated statements of operations",
+        "statements of operations",
+        "net sales",
+        "net revenue",
+        "total revenues",
+    ),
+    "cf": (
+        "consolidated statements of cash flows",
+        "statements of cash flows",
+        "net cash provided by operating activities",
+    ),
+}
+_STATEMENT_TRIGGERS = {
+    "bs": (
+        "ratio",
+        "liquidity",
+        "liabilit",
+        "asset",
+        "balance sheet",
+        "working capital",
+        "turnover",
+        "margin",
+        "leverage",
+        "debt",
+        "equity",
+        "capital",
+    ),
+    "is": ("margin", "income", "profit", "revenue", "sales", "eps", "earnings", "growth", "turnover", "return"),
+    "cf": ("cash flow", "operating activities", "capex", "capital expenditure", "free cash", "buyback", "dividend"),
+}
+_NUMBER = re.compile(r"\d[\d,\.]*")
+
+
+def _numbers(text: str) -> frozenset:
+    found = set()
+    for raw in _NUMBER.findall(text):
+        digits = re.sub(r"[^\d]", "", raw)
+        if len(digits) >= 3:
+            found.add(digits)
+            if digits.endswith("00") and len(digits) >= 4:
+                found.add(digits[:-2])
+    return frozenset(found)
+
+
 class _PageIndex(object):
-    __slots__ = ("entries", "counters", "lengths", "average_length", "document_frequency", "size")
+    __slots__ = ("entries", "counters", "lengths", "average_length", "document_frequency", "size", "lowered", "numbers")
 
     def __init__(self, entries, texts) -> None:
         from collections import Counter
@@ -365,17 +412,23 @@ class _PageIndex(object):
         counters = []
         lengths = []
         document_frequency = Counter()
+        lowered = []
+        numbers = []
         for text in texts:
             tokens = Counter(_tokens(text))
             counters.append(tokens)
             lengths.append(sum(tokens.values()) or 1)
             for token in tokens:
                 document_frequency[token] += 1
+            lowered.append(text.lower())
+            numbers.append(_numbers(text))
         self.counters = tuple(counters)
         self.lengths = tuple(lengths)
         self.size = len(counters)
         self.average_length = (sum(lengths) / self.size) if self.size else 1.0
         self.document_frequency = document_frequency
+        self.lowered = tuple(lowered)
+        self.numbers = tuple(numbers)
 
 
 _INDEX_CACHE = {}
@@ -422,6 +475,14 @@ def _query_terms(question: str, index) -> tuple:
     return primary, extra
 
 
+def _statement_kinds(question_terms: str) -> tuple:
+    kinds = []
+    for kind, triggers in _STATEMENT_TRIGGERS.items():
+        if any(trigger in question_terms for trigger in triggers):
+            kinds.append(kind)
+    return tuple(kinds)
+
+
 def _rank_pages(index, question: str, limit: int) -> list:
     import math
 
@@ -433,20 +494,78 @@ def _rank_pages(index, question: str, limit: int) -> list:
     for term in set(primary) | set(extra):
         frequency = index.document_frequency.get(term, 0)
         idf[term] = math.log(1 + (size - frequency + 0.5) / (frequency + 0.5))
-    scores = []
-    for position, counter in enumerate(index.counters):
-        length_ratio = index.lengths[position] / index.average_length
-        score = 0.0
-        for term in primary:
-            frequency = counter.get(term, 0)
-            if frequency:
-                score += (idf[term] ** 1.5) * (frequency * 2.2) / (frequency + 1.2 * (0.25 + 0.75 * length_ratio))
-        for term in extra:
-            frequency = counter.get(term, 0)
-            if frequency:
-                score += 0.7 * (idf[term] ** 1.5) * (frequency * 2.2) / (frequency + 1.2 * (0.25 + 0.75 * length_ratio))
-        scores.append(score)
+
+    def idf_of(term):
+        if term not in idf:
+            frequency = index.document_frequency.get(term, 0)
+            idf[term] = math.log(1 + (size - frequency + 0.5) / (frequency + 0.5))
+        return idf[term]
+
+    kinds = _statement_kinds(" ".join(_tokens(question)))
+    question_numbers = set(_numbers(question))
+
+    def structural_bonus(position) -> float:
+        # Financial questions are usually answered by one of the primary statements.  A page that
+        # carries the matching statement caption is a much better candidate than a narrative page
+        # that merely repeats the query words, so it gets a constant lift instead of a term weight.
+        bonus = 0.0
+        if kinds and index.lowered:
+            text = index.lowered[position]
+            for kind in kinds:
+                if any(hint in text for hint in _STATEMENT_HINTS[kind]):
+                    bonus += 6.0
+                    break
+        if question_numbers and index.numbers:
+            shared = len(question_numbers & index.numbers[position])
+            if shared:
+                bonus += 3.0 * min(shared, 3)
+        return bonus
+
+    def score_all(boost):
+        scores = []
+        for position, counter in enumerate(index.counters):
+            length_ratio = index.lengths[position] / index.average_length
+            score = 0.0
+            for term in primary:
+                frequency = counter.get(term, 0)
+                if frequency:
+                    score += (idf[term] ** 1.25) * (frequency * 2.2) / (frequency + 1.2 * (0.25 + 0.75 * length_ratio))
+            for term in extra:
+                frequency = counter.get(term, 0)
+                if frequency:
+                    score += 0.7 * (idf[term] ** 1.25) * (frequency * 2.2) / (frequency + 1.2 * (0.25 + 0.75 * length_ratio))
+            for term, weight in boost.items():
+                frequency = counter.get(term, 0)
+                if frequency:
+                    score += weight * (idf_of(term) ** 1.25) * (frequency * 2.2) / (
+                        frequency + 1.2 * (0.25 + 0.75 * length_ratio)
+                    )
+            score += structural_bonus(position)
+            scores.append(score)
+        return scores
+
+    scores = score_all({})
     order = sorted(range(len(scores)), key=lambda position: -scores[position])
+    # Pseudo-relevance feedback: the strongest first-pass pages show the wording a supporting page
+    # actually uses (statement captions, line-item names), so their distinctive terms are folded
+    # back into the query once.  A single weighted pass over two pages keeps the result stable and
+    # lifts evidence-page recall without hard-coding any document, query, or corpus.
+    feedback = {}
+    for position in order[:2]:
+        if scores[position] <= 0:
+            break
+        for term, frequency in index.counters[position].items():
+            if term in primary or term in extra or term.isdigit():
+                continue
+            if term in _STOPWORDS or term in _BOILERPLATE:
+                continue
+            weight = frequency * idf_of(term)
+            if weight > feedback.get(term, 0.0):
+                feedback[term] = weight
+    if feedback:
+        top_terms = sorted(feedback.items(), key=lambda item: -item[1])[:10]
+        scores = score_all({term: 0.2 for term, _ in top_terms})
+        order = sorted(range(len(scores)), key=lambda position: -scores[position])
     ranked = []
     for position in order:
         if scores[position] <= 0 or len(ranked) >= max(limit, 1):
