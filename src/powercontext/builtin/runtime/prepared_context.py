@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal slice of a Memory entry version delivered as evidence."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -235,6 +248,11 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if getattr(request, "evidence_selection", False) and request.assembly is None:
+            selected = self._select_evidence(request, memory_candidates)
+            if selected is not None:
+                return selected
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -254,6 +272,116 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _select_evidence(
+        self,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild | None:
+        """Deliver query-relevant literal slices of Memory entries instead of whole entries."""
+
+        records: list[tuple[MemoryEntryAddress, MemoryCitation, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for group in memory_candidates:
+            if not group.scope_id:
+                continue
+            for hit in group.hits:
+                key = (group.scope_id, hit.entry_id, hit.entry_version_id)
+                if key in seen or not hit.text.strip():
+                    continue
+                seen.add(key)
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                citation = MemoryCitation(
+                    memory_ref=hit.memory_ref,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                records.append((address, citation, hit.text))
+        if not records:
+            return None
+
+        query_terms = _evidence_terms(request.query)
+        if not query_terms:
+            return None
+        query_numbers = {term for term in query_terms if term.isdigit()}
+        windows: list[tuple[float, int, int, int, int]] = []
+        document_frequency: dict[str, int] = {}
+        for index, (_, _, text) in enumerate(records):
+            sentences = _evidence_sentences(text)
+            for start, end in sentences:
+                for term in _evidence_terms(text[start:end]):
+                    document_frequency.setdefault(term, 0)
+            for term in _evidence_terms(text):
+                document_frequency[term] = document_frequency.get(term, 0) + 1
+            for position, (start, end) in enumerate(sentences):
+                for width in (1, 2):
+                    if position + width > len(sentences):
+                        break
+                    span_start = start
+                    span_end = sentences[position + width - 1][1]
+                    score = _evidence_score(
+                        text[span_start:span_end],
+                        query_terms,
+                        document_frequency,
+                        len(records),
+                        query_numbers,
+                        width,
+                    )
+                    if score > 0.0:
+                        windows.append((score, index, span_start, span_end, width))
+        if not windows:
+            return None
+        windows.sort(key=lambda window: (-window[0], window[1], window[2]))
+
+        chosen: list[tuple[int, int, int, float]] = []
+        occupied: dict[int, list[tuple[int, int]]] = {}
+        fragments: list[PreparedContextFragment] = []
+        for score, index, start, end, width in windows:
+            spans = occupied.setdefault(index, [])
+            if any(not (end <= other_start or start >= other_end) for other_start, other_end in spans):
+                continue
+            candidate = (index, start, end, score)
+            if _evidence_bytes(records, [*chosen, candidate]) > request.max_bytes:
+                continue
+            chosen.append(candidate)
+            spans.append((start, end))
+        if not chosen:
+            return None
+        chosen.sort(key=lambda item: (item[0], item[1]))
+        items: list[dict[str, object]] = []
+        origins: list[PreparedContextOrigin] = []
+        for index, start, end, _ in chosen:
+            address, citation, text = records[index]
+            fragment_text = text[start:end]
+            fragments.append(PreparedContextFragment(address=address, start=start, end=end, text=fragment_text))
+            origins.append(citation)
+            items.append(
+                {
+                    "citation": {
+                        "scope_id": address.memory.scope_id,
+                        "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                        "entry_id": address.entry_id,
+                        "entry_version_id": address.entry_version_id,
+                    },
+                    "content": fragment_text,
+                    "start": start,
+                    "end": end,
+                    "truncated": False,
+                }
+            )
+        content = _render_evidence(items)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            return None
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(origins),
+            fragments=tuple(fragments),
         )
 
     def probe_budget(
@@ -728,3 +856,114 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+_EVIDENCE_STOPWORDS = frozenset(
+    """
+    a an and are as at be been both but by can could did do does for from had has have how i if in into is it
+    its may might more most no not of on or our should so some such than that the their them then there these
+    they this those to was we were what when where which who why will with would you your
+    """
+    .split()
+)
+_EVIDENCE_SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
+_EVIDENCE_TERM = re.compile(r"[a-z0-9]+(?:[.,][0-9]+)*")
+
+
+_EVIDENCE_SUFFIXES = ("ations", "ation", "ings", "ing", "edly", "ed", "ies", "es", "s", "ly", "ment")
+
+
+def _evidence_normalize(term: str) -> str:
+    if term.isdigit() or len(term) <= 4:
+        return term
+    for suffix in _EVIDENCE_SUFFIXES:
+        if term.endswith(suffix) and len(term) - len(suffix) >= 4:
+            return term[: -len(suffix)]
+    return term
+
+
+def _evidence_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    for raw in _EVIDENCE_TERM.findall(text.lower()):
+        term = raw.strip(".,")
+        if not term or term in _EVIDENCE_STOPWORDS:
+            continue
+        terms.append(_evidence_normalize(term))
+    return terms
+
+
+def _evidence_sentences(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in _EVIDENCE_SENTENCE.finditer(text):
+        start, end = match.span()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end - start >= 16:
+            spans.append((start, end))
+    if not spans and text.strip():
+        spans.append((0, len(text)))
+    return spans
+
+
+def _evidence_score(
+    fragment: str,
+    query_terms: list[str],
+    document_frequency: dict[str, int],
+    documents: int,
+    query_numbers: set[str],
+    width: int,
+) -> float:
+    tokens = _evidence_terms(fragment)
+    if not tokens:
+        return 0.0
+    counts: dict[str, int] = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    score = 0.0
+    for term in set(query_terms):
+        frequency = counts.get(term, 0)
+        if not frequency:
+            continue
+        rarity = document_frequency.get(term, 0)
+        idf = math.log(1.0 + (documents + 1.0) / (rarity + 0.5))
+        score += idf * (1.0 + math.log(frequency))
+        if term.isdigit() and term in query_numbers:
+            score += 1.5 * idf
+    lowered = fragment.lower()
+    for left, right in zip(query_terms, query_terms[1:]):
+        if left != right and f"{left} {right}" in lowered:
+            score += 1.2
+    covered = len({term for term in query_terms if counts.get(term)})
+    score += 0.35 * covered
+    return score / (1.0 + 0.08 * max(0, len(tokens) - 40)) / float(width)
+
+
+def _evidence_bytes(
+    records: Sequence[tuple[MemoryEntryAddress, MemoryCitation, str]],
+    chosen: Sequence[tuple[int, int, int, float]],
+) -> int:
+    items: list[dict[str, object]] = []
+    for index, start, end, _ in sorted(chosen, key=lambda item: (item[0], item[1])):
+        address, _, text = records[index]
+        items.append(
+            {
+                "citation": {
+                    "scope_id": address.memory.scope_id,
+                    "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": address.entry_id,
+                    "entry_version_id": address.entry_version_id,
+                },
+                "content": text[start:end],
+                "start": start,
+                "end": end,
+                "truncated": False,
+            }
+        )
+    return len(_render_evidence(items).encode("utf-8"))
+
+
+def _render_evidence(items: Sequence[dict[str, object]]) -> str:
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
